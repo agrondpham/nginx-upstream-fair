@@ -8,6 +8,9 @@
 #include <ngx_config.h>
 #include <ngx_core.h>
 #include <ngx_http.h>
+#if (NGX_HTTP_UPSTREAM_CHECK)
+#include "ngx_http_upstream_check_module.h"
+#endif
 
 typedef struct {
     ngx_uint_t                          nreq;
@@ -41,6 +44,10 @@ typedef struct {
     ngx_uint_t                          weight;
     ngx_uint_t                          max_fails;
     time_t                              fail_timeout;
+
+#if (NGX_HTTP_UPSTREAM_CHECK)
+    ngx_uint_t                          check_index;
+#endif
 
     time_t                              accessed;
     ngx_uint_t                          down:1;
@@ -474,6 +481,16 @@ ngx_http_upstream_init_fair_rr(ngx_conf_t *cf, ngx_http_upstream_srv_conf_t *us)
                 peers->peer[n].fail_timeout = server[i].fail_timeout;
                 peers->peer[n].down = server[i].down;
                 peers->peer[n].weight = server[i].down ? 0 : server[i].weight;
+
+#if (NGX_HTTP_UPSTREAM_CHECK)
+                if (!server[i].down) {
+                    peers->peer[n].check_index =
+                        ngx_http_upstream_check_add_peer(cf, us, &server[i].addrs[j]);
+                } else {
+                    peers->peer[n].check_index = (ngx_uint_t) NGX_ERROR;
+                }
+#endif
+
                 n++;
             }
         }
@@ -524,6 +541,16 @@ ngx_http_upstream_init_fair_rr(ngx_conf_t *cf, ngx_http_upstream_srv_conf_t *us)
                 backup->peer[n].max_fails = server[i].max_fails;
                 backup->peer[n].fail_timeout = server[i].fail_timeout;
                 backup->peer[n].down = server[i].down;
+
+#if (NGX_HTTP_UPSTREAM_CHECK)
+                if (!server[i].down) {
+                    backup->peer[n].check_index =
+                        ngx_http_upstream_check_add_peer(cf, us, &server[i].addrs[j]);
+                } else {
+                    backup->peer[n].check_index = (ngx_uint_t) NGX_ERROR;
+                }
+#endif
+
                 n++;
             }
         }
@@ -540,7 +567,11 @@ ngx_http_upstream_init_fair_rr(ngx_conf_t *cf, ngx_http_upstream_srv_conf_t *us)
 
     /* an upstream implicitly defined by proxy_pass, etc. */
 
+#if nginx_version < 1011006
     if (us->port == 0 && us->default_port == 0) {
+#else
+    if (us->port == 0) {
+#endif
         ngx_log_error(NGX_LOG_EMERG, cf->log, 0,
                       "no port in upstream \"%V\" in %s:%ui",
                       &us->host, us->file_name, us->line);
@@ -550,8 +581,11 @@ ngx_http_upstream_init_fair_rr(ngx_conf_t *cf, ngx_http_upstream_srv_conf_t *us)
     ngx_memzero(&u, sizeof(ngx_url_t));
 
     u.host = us->host;
+#if nginx_version < 1011006
     u.port = (in_port_t) (us->port ? us->port : us->default_port);
-
+#else
+    u.port = (in_port_t) us->port;
+#endif
     if (ngx_inet_resolve_host(cf->pool, &u) != NGX_OK) {
         if (u.err) {
             ngx_log_error(NGX_LOG_EMERG, cf->log, 0,
@@ -580,6 +614,11 @@ ngx_http_upstream_init_fair_rr(ngx_conf_t *cf, ngx_http_upstream_srv_conf_t *us)
         peers->peer[i].weight = 1;
         peers->peer[i].max_fails = 1;
         peers->peer[i].fail_timeout = 10;
+
+#if (NGX_HTTP_UPSTREAM_CHECK)
+        peers->peer[i].check_index = (ngx_uint_t) NGX_ERROR;
+#endif
+
     }
 
     us->peer.data = peers;
@@ -723,6 +762,15 @@ ngx_http_upstream_fair_try_peer(ngx_peer_connection_t *pc,
     peer = &fp->peers->peer[peer_id];
 
     if (!peer->down) {
+
+#if (NGX_HTTP_UPSTREAM_CHECK)
+        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, pc->log, 0,
+                       "[upstream_fair] get fair peer, check_index: %ui",
+                       peer->check_index);
+
+        if (!ngx_http_upstream_check_peer_down(peer->check_index)) {
+#endif
+
         if (peer->max_fails == 0 || peer->shared->fails < peer->max_fails) {
             return NGX_OK;
         }
@@ -733,6 +781,11 @@ ngx_http_upstream_fair_try_peer(ngx_peer_connection_t *pc,
             peer->shared->fails = 0;
             return NGX_OK;
         }
+
+#if (NGX_HTTP_UPSTREAM_CHECK)
+        }
+#endif
+
     }
 
     return NGX_BUSY;
@@ -1174,9 +1227,8 @@ ngx_http_upstream_fair_set_session(ngx_peer_connection_t *pc, void *data)
 
     rc = ngx_ssl_set_session(pc->connection, ssl_session);
 
-    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, pc->log, 0,
-                   "set session: %p:%d",
-                   ssl_session, ssl_session ? ssl_session->references : 0);
+    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, pc->log, 0,
+                   "set session: %p", ssl_session);
 
     /* ngx_unlock_mutex(fp->peers->mutex); */
 
@@ -1200,8 +1252,8 @@ ngx_http_upstream_fair_save_session(ngx_peer_connection_t *pc, void *data)
         return;
     }
 
-    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, pc->log, 0,
-                   "save session: %p:%d", ssl_session, ssl_session->references);
+    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, pc->log, 0,
+                   "save session: %p", ssl_session);
 
     peer = &fp->peers->peer[fp->current];
 
@@ -1215,9 +1267,8 @@ ngx_http_upstream_fair_save_session(ngx_peer_connection_t *pc, void *data)
 
     if (old_ssl_session) {
 
-        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, pc->log, 0,
-                       "old session: %p:%d",
-                       old_ssl_session, old_ssl_session->references);
+        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, pc->log, 0,
+                       "old session: %p", old_ssl_session);
 
         /* TODO: may block */
 
